@@ -1,165 +1,116 @@
 #!/usr/bin/env python
 """
 Main application for training, evaluating, and exporting the bacteria classification model.
+
+This script loads configuration from a YAML file, sets up the training pipeline
+(using bacteria_lib), and then runs the training process.
 """
 
 import os
 import datetime
-import pandas as pd
+import torch
 import pytorch_lightning as pl
 import optuna
-
 from omegaconf import OmegaConf, DictConfig
 
-# Import from the library
+# Import functions and classes from the bacteria_lib library.
 from bacteria_lib.data import PatchClassificationDataset
 from bacteria_lib.models import build_classifier
 from bacteria_lib.callbacks import PlotMetricsCallback, OptunaReportingCallback
-from bacteria_lib.utils import load_obj, set_seed
-
-# (Optionally, import transforms if needed)
-# from bacteria_lib.transforms import ToGray3
-
-# Configuration (could also be loaded from a config.yaml file)
-CONFIG_DICT = {
-    "stage_detection": False,
-    "stage_classification": True,
-    "general": {
-        "save_dir": "baclog_n1",
-        "project_name": "bacteria_n1"
-    },
-    "trainer": {
-        "devices": 1,
-        "accelerator": "auto",
-        "precision": "16-mixed",
-        "log_every_n_steps": 10
-    },
-    "training": {
-        "seed": 666,
-        "mode": "max",
-        "tuning_epochs_detection": 5,
-        "tuning_epochs_classification": 5,
-        "additional_epochs_detection": 5,
-        "additional_epochs_classification": 5,
-        "cross_validation": False,
-        "num_folds": 3
-    },
-    "optimizer": {
-        "class_name": "torch.optim.AdamW",
-        "params": {"lr": 1e-4, "weight_decay": 0.001}
-    },
-    "scheduler": {
-        "class_name": "torch.optim.lr_scheduler.ReduceLROnPlateau",
-        "step": "epoch",
-        "monitor": "val_acc",
-        "params": {"mode": "max", "factor": 0.1, "patience": 3}
-    },
-    "model": {
-        "backbone": {
-            "class_name": "torchvision.models.resnet50",
-            "params": {"weights": "ResNet50_Weights.IMAGENET1K_V1"}
-        }
-    },
-    "data": {
-        "detection_csv": r"path/to/stage1_train.csv",
-        "classification_csv": r"path/to/stage2_train.csv",
-        "test_csv": r"path/to/test.csv",
-        "folder_path": r"path/to/images",
-        "num_workers": 0,
-        "batch_size": 4,
-        "label_col": "label",
-        "valid_split": 0.2
-    },
-    "augmentation": {
-        "train": {
-            "augs": [
-                {"class_name": "albumentations.Resize", "params": {"height": 400, "width": 400, "p": 1.0}},
-                {"class_name": "__main__.ToGray3", "params": {"p": 1.0}},
-                {"class_name": "albumentations.HorizontalFlip", "params": {"p": 0.5}},
-                {"class_name": "albumentations.RandomBrightnessContrast", "params": {"p": 0.5}},
-                {"class_name": "albumentations.Normalize", "params": {}},
-                {"class_name": "albumentations.pytorch.transforms.ToTensorV2", "params": {"p": 1.0}}
-            ]
-        },
-        "valid": {
-            "augs": [
-                {"class_name": "albumentations.Resize", "params": {"height": 400, "width": 400, "p": 1.0}},
-                {"class_name": "__main__.ToGray3", "params": {"p": 1.0}},
-                {"class_name": "albumentations.Normalize", "params": {}},
-                {"class_name": "albumentations.pytorch.transforms.ToTensorV2", "params": {"p": 1.0}}
-            ]
-        }
-    },
-    "optuna": {
-        "use_optuna": True,
-        "n_trials": 5,
-        "params": {
-            "lr": {"min": 1e-5, "max": 1e-3, "type": "loguniform"},
-            "batch_size": {"values": [4, 8], "type": "categorical"},
-            "gradient_clip_val": {"min": 0.0, "max": 0.3, "type": "float"}
-        }
-    }
-}
-cfg: DictConfig = OmegaConf.create(CONFIG_DICT)
-
+from bacteria_lib.utils import set_seed
+from bacteria_lib.train_pipeline import (
+    train_stage,
+    train_with_cross_validation,
+    continue_training,
+    evaluate_model,
+    evaluate_on_test
+)
 
 def main() -> None:
     """
-    Main function to run training, evaluation, and model export.
+    Main function to run the training, evaluation, and model export pipeline.
     """
+    # Load configuration from config.yaml.
+    cfg_path = "config.yaml"
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"Config file not found: {cfg_path}")
+    cfg: DictConfig = OmegaConf.load(cfg_path)
+
+    # Set the random seed for reproducibility.
     set_seed(cfg.training.seed)
 
-    global BASE_SAVE_DIR
+    # Create directories for logs and model checkpoints.
     date_folder = datetime.datetime.now().strftime("%Y%m%d")
-    BASE_SAVE_DIR = os.path.join(cfg.general.save_dir, date_folder)
-    os.makedirs(BASE_SAVE_DIR, exist_ok=True)
-    
-    best_model_folder = os.path.join(BASE_SAVE_DIR, "best_model")
+    base_save_dir = os.path.join(cfg.general.save_dir, date_folder)
+    os.makedirs(base_save_dir, exist_ok=True)
+    best_model_folder = os.path.join(base_save_dir, "best_model")
     os.makedirs(best_model_folder, exist_ok=True)
-    
-    metrics_data = []  # For storing evaluation metrics
-    
-    # ----- Stage 1: Detection (if enabled) -----
-    if cfg.stage_detection:
-        print("Training Stage 1: Detection (binary classification)...")
-        # (Optuna tuning and training logic here)
-        # For brevity, assume similar structure as below.
-        # Save checkpoint and evaluate.
-        pass
 
-    # ----- Stage 2: Classification -----
+    # List to store evaluation metrics.
+    metrics_data = []
+
+    # ---------- Stage 1: Detection (if enabled) ----------
+    if cfg.stage_detection:
+        print("=== Stage 1: Detection (binary classification) ===")
+        if cfg.optuna.use_optuna:
+            study_det = optuna.create_study(
+                direction="maximize",
+                pruner=optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=2)
+            )
+            study_det.optimize(
+                lambda trial: train_stage(cfg, cfg.data.detection_csv, num_classes=2, stage_name="detection", trial=trial, suppress_metrics=True)[1],
+                n_trials=cfg.optuna.n_trials
+            )
+            print("Best detection trial:", study_det.best_trial)
+        # Use single-split training (or cross-validation if enabled)
+        if cfg.training.cross_validation:
+            detection_model, detection_cv_acc = train_with_cross_validation(cfg, cfg.data.detection_csv, num_classes=2, stage_name="detection")
+            print(f"Detection (CV) Average Accuracy: {detection_cv_acc:.4f}")
+            metrics_data.append({"stage": "detection_CV", "val_acc": float(detection_cv_acc)})
+        else:
+            detection_model, detection_val_acc = train_stage(cfg, cfg.data.detection_csv, num_classes=2, stage_name="detection")
+            print(f"Detection Stage Validation Accuracy: {detection_val_acc:.4f}")
+            metrics_data.append({"stage": "detection", "val_acc": float(detection_val_acc.item())})
+        detection_checkpoint = os.path.join(best_model_folder, "best_detection.ckpt")
+        torch.save(detection_model.state_dict(), detection_checkpoint)
+        print(f"Saved detection best model checkpoint to {detection_checkpoint}")
+        detection_model = continue_training(detection_model, cfg, cfg.data.detection_csv, num_classes=2, stage_name="detection")
+        evaluate_model(detection_model, cfg.data.detection_csv, cfg, stage="Detection")
+
+    # ---------- Stage 2: Classification ----------
     if cfg.stage_classification:
-        print("Training Stage 2: Classification (multi-class)...")
-        # Example: Use single-split training (set cross_validation False in cfg)
-        classification_csv = cfg.data.classification_csv
-        from bacteria_lib.data import PatchClassificationDataset  # Ensure using library import
-        from bacteria_lib.models import build_classifier
-        from bacteria_lib.callbacks import PlotMetricsCallback, OptunaReportingCallback
-        # (Here you would call the train_stage, continue_training, evaluate_model functions,
-        #  which you can import from your library if you package them there.
-        #  For this example, we assume they are defined in main.py.)
-        
-        # For demonstration, we'll call our previously defined train_stage:
-        from optuna.exceptions import TrialPruned  # if needed
-        
-        # --- Train Stage ---
-        classification_model, classification_val_acc = train_stage(cfg, classification_csv, num_classes=9, stage_name="classification")
-        print(f"Classification Stage Validation Accuracy: {classification_val_acc:.4f}")
-        metrics_data.append({"stage": "classification", "val_acc": float(classification_val_acc.item())})
-        
+        print("=== Stage 2: Classification (multi-class) ===")
+        if cfg.optuna.use_optuna:
+            study_cls = optuna.create_study(
+                direction="maximize",
+                pruner=optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=2)
+            )
+            study_cls.optimize(
+                lambda trial: train_stage(cfg, cfg.data.classification_csv, num_classes=9, stage_name="classification", trial=trial, suppress_metrics=True)[1],
+                n_trials=cfg.optuna.n_trials
+            )
+            print("Best classification trial:", study_cls.best_trial)
+        if cfg.training.cross_validation:
+            classification_model, classification_cv_acc = train_with_cross_validation(cfg, cfg.data.classification_csv, num_classes=9, stage_name="classification")
+            print(f"Classification (CV) Average Accuracy: {classification_cv_acc:.4f}")
+            metrics_data.append({"stage": "classification_CV", "val_acc": float(classification_cv_acc)})
+        else:
+            classification_model, classification_val_acc = train_stage(cfg, cfg.data.classification_csv, num_classes=9, stage_name="classification")
+            print(f"Classification Stage Validation Accuracy: {classification_val_acc:.4f}")
+            metrics_data.append({"stage": "classification", "val_acc": float(classification_val_acc.item())})
         classification_checkpoint = os.path.join(best_model_folder, "best_classification.ckpt")
         torch.save(classification_model.state_dict(), classification_checkpoint)
         print(f"Saved classification best model checkpoint to {classification_checkpoint}")
-        
-        classification_model = continue_training(classification_model, cfg, classification_csv, num_classes=9, stage_name="classification")
-        evaluate_model(classification_model, classification_csv, cfg, stage="Classification")
-    
-    # Save evaluation metrics for comparison.
+        classification_model = continue_training(classification_model, cfg, cfg.data.classification_csv, num_classes=9, stage_name="classification")
+        evaluate_model(classification_model, cfg.data.classification_csv, cfg, stage="Classification")
+
+    # ---------- Save Evaluation Metrics ----------
     metrics_df = pd.DataFrame(metrics_data)
-    eval_table_path = os.path.join(BASE_SAVE_DIR, "evaluation_metrics.csv")
+    eval_table_path = os.path.join(base_save_dir, "evaluation_metrics.csv")
     metrics_df.to_csv(eval_table_path, index=False)
     print(f"Saved evaluation metrics to {eval_table_path}")
-    
+
+    # ---------- Model Export ----------
     if cfg.stage_classification:
         classification_model.load_state_dict(torch.load(classification_checkpoint))
         classification_model.eval()
@@ -167,12 +118,12 @@ def main() -> None:
         export_path = os.path.join(best_model_folder, "best_classification_scripted.pt")
         scripted_model.save(export_path)
         print(f"Exported scripted classification model to {export_path}")
-    
-    # Optional: Evaluate on dedicated test set.
+
+    # ---------- Optional: Test Set Evaluation ----------
     if "test_csv" in cfg.data and os.path.exists(cfg.data.test_csv):
         print("Evaluating on the dedicated test set...")
         evaluate_on_test(classification_model, cfg.data.test_csv, cfg)
-    
+
     print("Training finished. Best models and evaluation metrics are saved in:", best_model_folder)
 
 
