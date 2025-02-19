@@ -2,8 +2,8 @@ stage_detection: false
 stage_classification: true
 
 general:
-  save_dir: "baclogs"
-  project_name: "bacteria_project"
+  save_dir: "baclog_n1"
+  project_name: "bacteria_n1"
 
 trainer:
   devices: 1
@@ -43,9 +43,10 @@ model:
       weights: "ResNet50_Weights.IMAGENET1K_V1"
 
 data:
-  detection_csv: "path/to/stage1_train.csv"
-  classification_csv: "path/to/stage2_train.csv"
-  folder_path: "path/to/images"
+  detection_csv: "C:/Users/Natthacha/Downloads/bts finnder/Dataset/Fa/stage1_train.csv"
+  classification_csv: "C:/Users/Natthacha/Downloads/bts finnder/Dataset/Fa/stage2_train.csv"
+  test_csv: "C:/Users/Natthacha/Downloads/bts finnder/Dataset/Fa/test.csv"
+  folder_path: "C:/Users/Natthacha/Downloads/bts finnder/Dataset/Fa"
   num_workers: 0
   batch_size: 4
   label_col: "label"
@@ -59,7 +60,7 @@ augmentation:
           height: 400
           width: 400
           p: 1.0
-      - class_name: "__main__.ToGray3"
+      - class_name: "bacteria_lib.transforms.ToGray3"
         params:
           p: 1.0
       - class_name: "albumentations.HorizontalFlip"
@@ -80,7 +81,7 @@ augmentation:
           height: 400
           width: 400
           p: 1.0
-      - class_name: "__main__.ToGray3"
+      - class_name: "bacteria_lib.transforms.ToGray3"
         params:
           p: 1.0
       - class_name: "albumentations.Normalize"
